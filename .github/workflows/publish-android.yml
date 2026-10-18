@@ -1,0 +1,150 @@
+name: Publish prebuilt Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "APK versionName, for example 0.5.10"
+        required: true
+        type: string
+      notes:
+        description: "Public release notes"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout distribution repository
+        uses: actions/checkout@v4
+
+      - name: Set up Android SDK tools for APK verification
+        uses: android-actions/setup-android@v3
+
+      - name: Install APK verification tools
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Verify staged APK identity and signature
+        id: verify
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Version must look like 0.5.10" >&2
+            exit 1
+          fi
+          APK="incoming/JinsuTV-${VERSION}-Android.apk"
+          test -f "$APK" || { echo "Missing $APK; upload and commit it first." >&2; exit 1; }
+          TOOLS="$ANDROID_HOME/build-tools/35.0.0"
+          BADGING=$("$TOOLS/aapt2" dump badging "$APK")
+          printf '%s\n' "$BADGING" | grep -F "package: name='app.jinsu.tv'" >/dev/null
+          printf '%s\n' "$BADGING" | grep -F "versionName='$VERSION'" >/dev/null
+          CODE=$(printf '%s\n' "$BADGING" | sed -n "s/.*versionCode='\([0-9][0-9]*\)'.*/\1/p" | head -1)
+          test -n "$CODE" || { echo "Cannot read APK versionCode" >&2; exit 1; }
+          SIGNATURE=$("$TOOLS/apksigner" verify --verbose --print-certs "$APK")
+          printf '%s\n' "$SIGNATURE" | grep -F 'Verified using v2 scheme (APK Signature Scheme v2): true' >/dev/null
+          printf '%s\n' "$SIGNATURE" | grep -F 'Verified using v3 scheme (APK Signature Scheme v3): true' >/dev/null
+          CERT=$(printf '%s\n' "$SIGNATURE" | sed -n 's/.*Signer #1 certificate SHA-256 digest: //p' | head -1)
+          EXPECTED_CERT='deea3d0bf8c167d8ab1cdeabb570a3be6014da261066c79c4b1914bb371bbbcc'
+          test "$CERT" = "$EXPECTED_CERT" || { echo "APK signing certificate is not the configured Android release key." >&2; exit 1; }
+          echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
+          echo "version_code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$APK" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "Verified $APK versionCode=$CODE sha256=$(sha256sum "$APK" | awk '{print $1}')"
+
+      - name: Require a monotonically increasing versionCode
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_CODE: ${{ steps.verify.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          TOOLS="$ANDROID_HOME/build-tools/35.0.0"
+          LATEST_JSON=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest")
+          LATEST_URL=$(printf '%s' "$LATEST_JSON" | python3 -c 'import json,sys; j=json.load(sys.stdin); a=[x["browser_download_url"] for x in j.get("assets",[]) if x.get("name","").endswith("-Android.apk")]; print(a[0] if len(a)==1 else "")')
+          test -n "$LATEST_URL" || { echo "Cannot identify the current latest Android APK." >&2; exit 1; }
+          curl -fLsS "$LATEST_URL" -o "$RUNNER_TEMP/current-latest.apk"
+          LATEST_BADGING=$("$TOOLS/aapt2" dump badging "$RUNNER_TEMP/current-latest.apk")
+          LATEST_CODE=$(printf '%s\n' "$LATEST_BADGING" | sed -n "s/.*versionCode='\([0-9][0-9]*\)'.*/\1/p" | head -1)
+          test -n "$LATEST_CODE" || { echo "Cannot read current latest versionCode." >&2; exit 1; }
+          if [ "$VERSION_CODE" -le "$LATEST_CODE" ]; then
+            echo "Refusing versionCode $VERSION_CODE; current latest is $LATEST_CODE." >&2
+            exit 1
+          fi
+
+      - name: Create public GitHub Release and upload the APK
+        uses: actions/github-script@v7
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_NOTES: ${{ inputs.notes }}
+          APK_PATH: ${{ steps.verify.outputs.apk_path }}
+          EXPECTED_SHA256: ${{ steps.verify.outputs.sha256 }}
+        with:
+          script: |
+            const fs = require('fs');
+            const crypto = require('crypto');
+            const { owner, repo } = context.repo;
+            const version = process.env.RELEASE_VERSION;
+            const tag = `v${version}`;
+            const apkPath = process.env.APK_PATH;
+            const data = fs.readFileSync(apkPath);
+            const sha = crypto.createHash('sha256').update(data).digest('hex');
+            if (sha !== process.env.EXPECTED_SHA256) {
+              core.setFailed('APK changed after verification; refusing to publish.');
+              return;
+            }
+            try {
+              await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+              core.setFailed(`Release ${tag} already exists; refusing to replace it.`);
+              return;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            const release = await github.rest.repos.createRelease({
+              owner, repo,
+              tag_name: tag,
+              target_commitish: 'main',
+              name: `진수티비 Android ${version}`,
+              body: process.env.RELEASE_NOTES,
+              draft: false,
+              prerelease: false,
+              make_latest: 'true'
+            });
+            const uploaded = await github.rest.repos.uploadReleaseAsset({
+              owner, repo,
+              release_id: release.data.id,
+              name: `JinsuTV-${version}-Android.apk`,
+              data,
+              headers: {
+                'content-type': 'application/vnd.android.package-archive',
+                'content-length': String(data.length)
+              }
+            });
+            if (uploaded.data.size !== data.length || uploaded.data.digest !== `sha256:${sha}`) {
+              core.setFailed('GitHub asset size or SHA-256 did not match the staged APK.');
+              return;
+            }
+            core.info(`Published ${release.data.html_url}`);
+            core.info(`APK SHA-256: ${sha}`);
+
+      - name: Remove staged APK from the repository after publishing
+        if: success()
+        continue-on-error: true
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          APK="incoming/JinsuTV-${VERSION}-Android.apk"
+          if [ -f "$APK" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git rm -- "$APK"
+            git commit -m "chore: remove staged Android APK for v${VERSION}"
+            git push
+          fi
